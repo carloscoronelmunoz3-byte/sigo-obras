@@ -1264,6 +1264,133 @@ body{font-family:var(--fn);font-size:13px;color:var(--tx);background:var(--bg);m
 
 <div id="toast"></div>
 <script>
+/* ══ NEON SQL ADAPTER ══ */
+const NEON_ENDPOINT = "https://ep-rough-sky-aquo1w8v.c-8.us-east-1.aws.neon.tech/sql";
+const NEON_CONN_STR = "postgresql://neondb_owner:npg_glm2wYKHP1ar@ep-rough-sky-aquo1w8v.c-8.us-east-1.aws.neon.tech/neondb?sslmode=require";
+const NEON_PASS     = "npg_glm2wYKHP1ar";
+let _req=0;
+
+async function neonQuery(sql, params){
+  params=params||[];
+  const res=await fetch(NEON_ENDPOINT,{
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "Authorization":"Bearer "+NEON_PASS,
+      "Neon-Connection-String":NEON_CONN_STR
+    },
+    body:JSON.stringify({query:sql,params:params})
+  });
+  if(!res.ok){const t=await res.text();throw new Error("Neon HTTP "+res.status+": "+t.substring(0,150));}
+  const d=await res.json();
+  return d.rows||[];
+}
+
+function parseQS(qs){
+  const p={};if(!qs)return p;
+  qs.split("&").forEach(function(s){const eq=s.indexOf("=");if(eq>0)p[decodeURIComponent(s.slice(0,eq))]=decodeURIComponent(s.slice(eq+1));});
+  return p;
+}
+
+function buildWhere(params,offset){
+  const conds=[],vals=[];let idx=offset+1;
+  const skip={select:1,order:1,limit:1,offset:1};
+  Object.entries(params).forEach(function(e){
+    const k=e[0],v=e[1];if(skip[k])return;
+    const dot=v.indexOf(".");if(dot<0)return;
+    const op=v.slice(0,dot),val=v.slice(dot+1);
+    if(op==="in"){
+      const items=val.replace(/[()]/g,"").split(",").filter(Boolean);
+      if(!items.length)return;
+      conds.push('"'+k+'" IN ('+items.map(function(_,i){return "$"+(idx+i);}).join(",")+")");
+      items.forEach(function(x){vals.push(isNaN(x)||x===""?x:Number(x));});
+      idx+=items.length;
+    }else{
+      const sqlOp={eq:"=",neq:"!=",gt:">",gte:">=",lt:"<",lte:"<="}[op]||"=";
+      conds.push('"'+k+'" '+sqlOp+" $"+idx);
+      vals.push(isNaN(val)||val===""?val:Number(val));idx++;
+    }
+  });
+  return{w:conds.length?" WHERE "+conds.join(" AND "):"",v:vals};
+}
+
+function buildOrder(params){
+  if(!params.order)return"";
+  return" ORDER BY "+params.order.split(",").map(function(p){
+    const pts=p.split(".");return'"'+pts[0]+'" '+(pts[1]==="desc"?"DESC":"ASC");
+  }).join(",");
+}
+
+function buildSelect(sel){
+  if(!sel||sel==="*")return"*";
+  return sel.split(",").map(function(s){
+    if(s.indexOf("(")>=0){const col=s.split("(")[0];return col==="*"?"*":'"'+col+'"';}
+    return s==="*"?"*":'"'+s+'"';
+  }).join(",");
+}
+
+async function sb(path,opts){
+  opts=opts||{};_req++;setSyn(true);
+  try{
+    const qIdx=path.indexOf("?");
+    const table=qIdx>=0?path.slice(0,qIdx):path;
+    const params=qIdx>=0?parseQS(path.slice(qIdx+1)):{};
+    const method=opts.method||"GET";
+    if(method==="GET"){
+      const sel=params.select||"*";
+      const relMatches=[];const relRe=/[a-z_]+\([^)]+\)/g;let rm;
+      while((rm=relRe.exec(sel))!==null)relMatches.push(rm[0]);
+      const cleanSel=sel.replace(/,?[a-z_]+\([^)]+\)/g,"").replace(/^,/,"").replace(/,$/,"")||"*";
+      const wr=buildWhere(params,0);
+      const lim=params.limit?" LIMIT "+parseInt(params.limit):"";
+      const sql="SELECT "+buildSelect(cleanSel)+' FROM "'+table+'"'+wr.w+buildOrder(params)+lim;
+      const rows=await neonQuery(sql,wr.v);
+      for(let i=0;i<relMatches.length;i++){
+        const m=relMatches[i];const relTable=m.split("(")[0];
+        const relCols=m.match(/\(([^)]+)\)/)[1];
+        const fkCandidates=[relTable+"_id",relTable.replace(/s$/,"")+"_id"];
+        let fkCol=null;
+        if(rows.length)fkCandidates.forEach(function(f){if(rows[0][f]!==undefined)fkCol=f;});
+        if(!fkCol)continue;
+        const ids=[...new Set(rows.map(function(r){return r[fkCol];}).filter(function(x){return x!=null;}))];
+        if(!ids.length){rows.forEach(function(r){r[relTable]=null;});continue;}
+        const rCols=relCols==="*"?"*":relCols.split(",").map(function(c){return'"'+c+'"';}).join(",");
+        const relRows=await neonQuery("SELECT "+rCols+' FROM "'+relTable+'" WHERE id IN ('+ids.map(function(_,j){return"$"+(j+1);}).join(",")+")",ids);
+        const rmap={};relRows.forEach(function(r){rmap[r.id]=r;});
+        rows.forEach(function(r){r[relTable]=rmap[r[fkCol]]||null;});
+      }
+      return rows;
+    }
+    if(method==="POST"){
+      const data=typeof opts.body==="string"?JSON.parse(opts.body):opts.body;
+      const rows=Array.isArray(data)?data:[data];if(!rows.length)return[];
+      const cols=Object.keys(rows[0]);const allVals=[];
+      const vsets=rows.map(function(row){
+        const rv=cols.map(function(c){return row[c]===undefined?null:row[c];});
+        allVals.push.apply(allVals,rv);
+        return"("+rv.map(function(_,i){return"$"+(allVals.length-rv.length+i+1);}).join(",")+")";
+      });
+      const pref=(opts.headers&&opts.headers.Prefer)||"return=representation";
+      const ret=pref.includes("minimal")?"":" RETURNING *";
+      return await neonQuery("INSERT INTO \""+table+"\" ("+cols.map(function(c){return'"'+c+'"';}).join(",")+")"+" VALUES "+vsets.join(",")+ret,allVals);
+    }
+    if(method==="PATCH"){
+      const data=typeof opts.body==="string"?JSON.parse(opts.body):opts.body;
+      const cols=Object.keys(data);
+      const setVals=cols.map(function(c){return data[c]===undefined?null:data[c];});
+      const setClause=cols.map(function(c,i){return'"'+c+'"=$'+(i+1);}).join(",");
+      const wr=buildWhere(params,setVals.length);
+      return await neonQuery("UPDATE \""+table+"\" SET "+setClause+wr.w+" RETURNING *",[...setVals,...wr.v]);
+    }
+    if(method==="DELETE"){
+      const wr=buildWhere(params,0);
+      await neonQuery("DELETE FROM \""+table+'"'+wr.w,wr.v);return[];
+    }
+    return[];
+  }finally{_req--;if(!_req)setTimeout(function(){setSyn(false);},500);}
+}
+
+
 /* ══ GLOBALS ══ */
 let SB='', KEY='', _pers=[], _eqs=[], _frs=[];
 let _impData=[], _impCols=[];
@@ -3348,165 +3475,6 @@ async function guardarCosto(){
     toast('Costo guardado ✓'); cerrarMo('mo-costo'); cargarCostosMes(); cargarKPIsGerenciales();
   }catch(e){toast('Error: '+e.message,'err');}
 }
-
 </script>
 </body>
 </html>
-
-/* ══ NEON SQL ADAPTER ══ */
-const NEON_ENDPOINT = "https://ep-rough-sky-aquo1w8v.c-8.us-east-1.aws.neon.tech/sql";
-const NEON_CONN_STR = "postgresql://neondb_owner:npg_glm2wYKHP1ar@ep-rough-sky-aquo1w8v.c-8.us-east-1.aws.neon.tech/neondb?sslmode=require";
-const NEON_PASS     = "npg_glm2wYKHP1ar";
-let _req=0;
-
-async function neonQuery(sql, params){
-  params=params||[];
-  const res=await fetch(NEON_ENDPOINT,{
-    method:'POST',
-    headers:{
-      'Content-Type':'application/json',
-      'Authorization':'Bearer '+NEON_PASS,
-      'Neon-Connection-String':NEON_CONN_STR
-    },
-    body:JSON.stringify({query:sql,params:params})
-  });
-  if(!res.ok){const t=await res.text();throw new Error('Neon HTTP '+res.status+': '+t.substring(0,150));}
-  const d=await res.json();
-  return d.rows||[];
-}
-
-function parseQS(qs){
-  const p={};
-  if(!qs) return p;
-  qs.split('&').forEach(function(s){
-    const eq=s.indexOf('=');
-    if(eq>0) p[decodeURIComponent(s.slice(0,eq))]=decodeURIComponent(s.slice(eq+1));
-  });
-  return p;
-}
-
-function buildWhere(params,offset){
-  const conds=[],vals=[];
-  let idx=offset+1;
-  const skip={select:1,order:1,limit:1,offset:1};
-  Object.entries(params).forEach(function(e){
-    const k=e[0],v=e[1];
-    if(skip[k]) return;
-    const dot=v.indexOf('.');
-    if(dot<0) return;
-    const op=v.slice(0,dot),val=v.slice(dot+1);
-    if(op==='in'){
-      const items=val.replace(/[()]/g,'').split(',').filter(Boolean);
-      if(!items.length) return;
-      const ph=items.map(function(_,i){return '$'+(idx+i);});
-      conds.push('"'+k+'" IN ('+ph.join(',')+')');
-      items.forEach(function(x){vals.push(isNaN(x)||x===''?x:Number(x));});
-      idx+=items.length;
-    } else {
-      const sqlOp={eq:'=',neq:'!=',gt:'>',gte:'>=',lt:'<',lte:'<='}[op]||'=';
-      conds.push('"'+k+'" '+sqlOp+' $'+idx);
-      vals.push(isNaN(val)||val===''?val:Number(val));
-      idx++;
-    }
-  });
-  return {w:conds.length?' WHERE '+conds.join(' AND '):'',v:vals};
-}
-
-function buildOrder(params){
-  if(!params.order) return '';
-  return ' ORDER BY '+params.order.split(',').map(function(p){
-    const pts=p.split('.');
-    return '"'+pts[0]+'" '+(pts[1]==='desc'?'DESC':'ASC');
-  }).join(',');
-}
-
-function buildSelect(sel){
-  if(!sel||sel==='*') return '*';
-  return sel.split(',').map(function(s){
-    if(s.indexOf('(')>=0){
-      const col=s.split('(')[0];
-      return col==='*'?'*':'"'+col+'"';
-    }
-    return s==='*'?'*':'"'+s+'"';
-  }).join(',');
-}
-
-async function sb(path,opts){
-  opts=opts||{};
-  _req++;setSyn(true);
-  try{
-    const qIdx=path.indexOf('?');
-    const table=qIdx>=0?path.slice(0,qIdx):path;
-    const params=qIdx>=0?parseQS(path.slice(qIdx+1)):{};
-    const method=opts.method||'GET';
-
-    if(method==='GET'){
-      const sel=params.select||'*';
-      const relMatches=[];
-      const relRe=/[a-z_]+\([^)]+\)/g;
-      let rm;
-      while((rm=relRe.exec(sel))!==null) relMatches.push(rm[0]);
-      const cleanSel=sel.replace(/,?[a-z_]+\([^)]+\)/g,'').replace(/^,/,'').replace(/,$/,'')||'*';
-      const wr=buildWhere(params,0);
-      const ord=buildOrder(params);
-      const lim=params.limit?' LIMIT '+parseInt(params.limit):'';
-      const sql='SELECT '+buildSelect(cleanSel)+' FROM "'+table+'"'+wr.w+ord+lim;
-      const rows=await neonQuery(sql,wr.v);
-      for(let i=0;i<relMatches.length;i++){
-        const m=relMatches[i];
-        const relTable=m.split('(')[0];
-        const relCols=m.match(/\(([^)]+)\)/)[1];
-        const fkCandidates=[relTable+'_id',relTable.replace(/s$/,'')+'_id'];
-        let fkCol=null;
-        if(rows.length) fkCandidates.forEach(function(f){if(rows[0][f]!==undefined)fkCol=f;});
-        if(!fkCol) continue;
-        const ids=[...new Set(rows.map(function(r){return r[fkCol];}).filter(function(x){return x!=null;}))];
-        if(!ids.length){rows.forEach(function(r){r[relTable]=null;});continue;}
-        const ph=ids.map(function(_,j){return '$'+(j+1);}).join(',');
-        const rCols=relCols==='*'?'*':relCols.split(',').map(function(c){return '"'+c+'"';}).join(',');
-        const relRows=await neonQuery('SELECT '+rCols+' FROM "'+relTable+'" WHERE id IN ('+ph+')',ids);
-        const rmap={};relRows.forEach(function(r){rmap[r.id]=r;});
-        rows.forEach(function(r){r[relTable]=rmap[r[fkCol]]||null;});
-      }
-      return rows;
-    }
-
-    if(method==='POST'){
-      const data=typeof opts.body==='string'?JSON.parse(opts.body):opts.body;
-      const rows=Array.isArray(data)?data:[data];
-      if(!rows.length) return [];
-      const cols=Object.keys(rows[0]);
-      const allVals=[];
-      const vsets=rows.map(function(row){
-        const rv=cols.map(function(c){return row[c]===undefined?null:row[c];});
-        allVals.push.apply(allVals,rv);
-        return '('+rv.map(function(_,i){return '$'+(allVals.length-rv.length+i+1);}).join(',')+')';
-      });
-      const pref=(opts.headers&&opts.headers.Prefer)||'return=representation';
-      const ret=pref.includes('minimal')?'':' RETURNING *';
-      const sql='INSERT INTO "'+table+'" ('+cols.map(function(c){return '"'+c+'"';}).join(',')+')'
-        +' VALUES '+vsets.join(',')+ret;
-      return await neonQuery(sql,allVals);
-    }
-
-    if(method==='PATCH'){
-      const data=typeof opts.body==='string'?JSON.parse(opts.body):opts.body;
-      const cols=Object.keys(data);
-      const setVals=cols.map(function(c){return data[c]===undefined?null:data[c];});
-      const setClause=cols.map(function(c,i){return '"'+c+'"=$'+(i+1);}).join(',');
-      const wr=buildWhere(params,setVals.length);
-      const sql='UPDATE "'+table+'" SET '+setClause+wr.w+' RETURNING *';
-      return await neonQuery(sql,[...setVals,...wr.v]);
-    }
-
-    if(method==='DELETE'){
-      const wr=buildWhere(params,0);
-      await neonQuery('DELETE FROM "'+table+'"'+wr.w,wr.v);
-      return [];
-    }
-    return [];
-  }finally{
-    _req--;if(!_req)setTimeout(function(){setSyn(false);},500);
-  }
-}
-
