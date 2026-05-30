@@ -2463,35 +2463,24 @@ async function cargarPlanilla(){
 // Exportar planilla completa con todos los grupos
 function exportPlanillaCompleta(){
   const tbodys=['tbody-dir','tbody-ing','tbody-top','tbody-sso','tbody-adm','tbody-ope','tbody-vig','tbody-peo','tbody-sc'];
-  const headers=['Nombre completo','DNI','Cargo','Frente','S/ día','Ingreso','Estado'];
-  let csv=headers.map(h=>'"'+h+'"').join(',')+',Grupo
-';
-  const grupos={
-    'tbody-dir':'Dirección',
-    'tbody-ing':'Ing. Producción',
-    'tbody-top':'Topografía',
-    'tbody-sso':'SSOMA/Calidad',
-    'tbody-adm':'Administración',
-    'tbody-ope':'Operarios',
-    'tbody-vig':'Vigías',
-    'tbody-peo':'Peones',
-    'tbody-sc':'Sin clasificar'
-  };
-  tbodys.forEach(tbid=>{
+  const headers=['Nombre completo','DNI','Cargo','Frente','S/ dia','Ingreso','Estado'];
+  const grupos={'tbody-dir':'Direccion','tbody-ing':'Ing. Produccion','tbody-top':'Topografia','tbody-sso':'SSOMA/Calidad','tbody-adm':'Administracion','tbody-ope':'Operarios','tbody-vig':'Vigias','tbody-peo':'Peones','tbody-sc':'Sin clasificar'};
+  let csv=headers.map(function(h){return '"'+h+'"';}).join(',')+',Grupo\n';
+  tbodys.forEach(function(tbid){
     const tb=document.getElementById(tbid);if(!tb)return;
-    const rows=[...tb.querySelectorAll('tr')].filter(r=>!r.classList.contains('lrow'));
-    rows.forEach(row=>{
+    const rows=[...tb.querySelectorAll('tr')].filter(function(r){return !r.classList.contains('lrow');});
+    rows.forEach(function(row){
       const cells=[...row.querySelectorAll('td')].slice(0,7);
-      const vals=cells.map(td=>'"'+td.textContent.trim().replace(/"/g,'""')+'"');
-      csv+=vals.join(',')+',"'+grupos[tbid]+'"
-';
+      const vals=cells.map(function(td){return '"'+td.textContent.trim().replace(/"/g,'""')+'"';});
+      csv+=vals.join(',')+',"'+(grupos[tbid]||tbid)+'"\n';
     });
   });
-  const blob=new Blob(['﻿'+csv],{type:'text/csv;charset=utf-8;'});
+  const blob=new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8;'});
   const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');a.href=url;a.download='Planilla_Completa_'+new Date().toISOString().slice(0,10)+'.csv';
+  const a=document.createElement('a');a.href=url;
+  a.download='Planilla_Completa_'+new Date().toISOString().slice(0,10)+'.csv';
   a.click();URL.revokeObjectURL(url);
-  toast('✓ Planilla completa exportada','ok');
+  toast('Planilla completa exportada','ok');
 }
 function actualizarSubcat(){
   const cat=document.getElementById('pn-c').value;
